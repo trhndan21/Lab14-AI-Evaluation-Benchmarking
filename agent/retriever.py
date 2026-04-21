@@ -144,8 +144,15 @@ def _cmd_test_retrieve(version: str, question: str, top_k: int, trials: int):
     retriever = Retriever()
 
     if trials > 1:
-        rng_test = random.Random(RANDOM_SEED)
-        random_count = sum(1 for _ in range(trials) if rng_test.random() < RANDOM_RATE_V1)
+        if version != "v1":
+            print("Trials mode currently supports --version v1 only.")
+            return
+        random_count = 0
+        for _ in range(trials):
+            result = retriever.retrieve(question, version=version, top_k=top_k)
+            # In v1, nhánh random đang trả scores toàn 0.0
+            if result["scores"] and all(score == 0.0 for score in result["scores"]):
+                random_count += 1
         print(f"\nTrials={trials}, branch=random count={random_count} ({random_count/trials*100:.1f}%)")
         print("Expected range: 45-55%")
         return
