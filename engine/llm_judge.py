@@ -1,227 +1,352 @@
 import asyncio
 import json
 import os
+import re
 import time
-from typing import Dict, Any, List, Optional
-from openai import AsyncOpenAI
+from typing import Any, Dict, List, Optional
+
 import google.generativeai as genai
 from dotenv import load_dotenv
+from openai import AsyncOpenAI
 
 load_dotenv()
 
-# --- Thông số cố định theo Task 3 (Tối ưu cho environment hiện tại) ---
+# Task 3 fixed params
 GPT_MODEL = "gpt-4o-mini"
-GEMINI_MODEL = "gemini-flash-latest"
-SCORE_RANGE = (1, 5)
+GEMINI_MODEL = "gemini-1.5-flash"
 WEIGHT_ACCURACY = 0.7
 WEIGHT_GROUNDING = 0.3
 AGREEMENT_STRICT_DIFF = 1
-REQUEST_TIMEOUT_SECONDS = 60
+REQUEST_TIMEOUT_SECONDS = 30
+SCORE_MIN = 1
+SCORE_MAX = 5
 
-# Ước tính chi phí (USD trên 1M tokens)
+# Approximate pricing per 1M tokens
 COST_CONFIG = {
     "gpt-4o-mini": {"input": 0.15, "output": 0.60},
-    "gemini-2.0-flash": {"input": 0.1, "output": 0.4}
+    "gemini-1.5-flash": {"input": 0.10, "output": 0.40},
 }
+
 
 class LLMJudge:
     def __init__(self, gpt_model: str = GPT_MODEL, gemini_model: str = GEMINI_MODEL):
         self.gpt_model = gpt_model
         self.gemini_model = gemini_model if gemini_model.startswith("models/") else f"models/{gemini_model}"
-        
-        # Cấu hình API Clients
+
         self.openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
         self.genai_model = genai.GenerativeModel(self.gemini_model)
-        
-        # Định nghĩa rubrics theo yêu cầu Task 3
+
         self.rubrics = {
             "accuracy": {
-                "1": "Hoàn toàn sai hoặc không liên quan đến Expected Answer.",
-                "2": "Có một vài ý đúng nhưng phần lớn là sai thông tin quan trọng.",
-                "3": "Đúng khoảng 50-70%, thiếu một vài chi tiết hoặc diễn đạt chưa chuẩn.",
-                "4": "Rất chính xác, chỉ thiếu sót những chi tiết cực nhỏ.",
-                "5": "Hoàn hảo, chính xác tuyệt đối so với Expected Answer."
+                "1": "Hoàn toàn sai hoặc không liên quan đến expected answer.",
+                "2": "Có ý đúng nhỏ nhưng sai/thiếu phần lớn ý quan trọng.",
+                "3": "Đúng khoảng 50-70%, còn thiếu ý trọng yếu.",
+                "4": "Gần đúng đầy đủ, chỉ thiếu chi tiết nhỏ.",
+                "5": "Chính xác và đầy đủ theo expected answer.",
             },
             "grounding": {
-                "1": "Hallucination nghiêm trọng, thông tin bịa đặt hoàn toàn không có trong context.",
-                "3": "Có sử dụng context nhưng có lẫn thông tin bên ngoài không được xác thực.",
-                "5": "Hoàn toàn dựa trên tài liệu tham khảo (retrieved chunks), không thêm thắt."
-            }
+                "1": "Bịa đặt/hallucination, không bám retrieved chunks.",
+                "2": "Có dùng context nhưng vẫn suy diễn nhiều.",
+                "3": "Bám context một phần, còn vài chỗ không chắc.",
+                "4": "Bám tốt context, sai sót rất nhỏ.",
+                "5": "Hoàn toàn dựa trên retrieved chunks, không thêm thắt.",
+            },
         }
 
-    def _build_judge_prompt(self, question: str, answer: str, expected_answer: str, retrieved_chunks: List[str]) -> str:
-        context_str = "\n".join([f"- {c}" for c in retrieved_chunks])
+    def _build_judge_prompt(
+        self,
+        question: str,
+        agent_answer: str,
+        expected_answer: str,
+        retrieved_chunks: List[str],
+    ) -> str:
+        context = "\n".join(f"- {c}" for c in (retrieved_chunks or []))
+        if not context:
+            context = "- (Không có retrieved chunks)"
+
         return f"""
-Bạn là một chuyên gia đánh giá chất lượng AI Agent (AI Judge). 
-Nhiệm vụ của bạn là chấm điểm câu trả lời của Agent dựa trên 'Expected Answer' và 'Retrieved Chunks' (Tài liệu tham khảo).
+Bạn là AI Judge trung lập. Chỉ chấm theo dữ liệu cung cấp, không suy diễn ngoài phạm vi.
 
-[DỮ LIỆU ĐÁNH GIÁ]
-- Câu hỏi: {question}
-- Expected Answer (Đáp án kỳ vọng): {expected_answer}
-- Retrieved Chunks (Tài liệu Agent đã đọc):
-{context_str}
-- Agent's Answer (Câu trả lời cần chấm): {answer}
+[DỮ LIỆU]
+- Question: {question}
+- Expected Answer: {expected_answer}
+- Retrieved Chunks:
+{context}
+- Agent Answer: {agent_answer}
 
-[TIÊU CHÍ CHẤM ĐIỂM]
-1. Accuracy (Độ chính xác so với Expected Answer):
+[THANG ĐIỂM]
+1) accuracy_score (1-5): so với Expected Answer
 {json.dumps(self.rubrics['accuracy'], ensure_ascii=False, indent=2)}
 
-2. Grounding (Độ trung thực so với Retrieved Chunks):
+2) grounding_score (1-5): mức bám Retrieved Chunks
 {json.dumps(self.rubrics['grounding'], ensure_ascii=False, indent=2)}
 
-[YÊU CẦU ĐẦU RA]
-Trả về định dạng JSON duy nhất:
+[OUTPUT JSON BẮT BUỘC]
 {{
   "accuracy_score": <int 1-5>,
   "grounding_score": <int 1-5>,
-  "reasoning": "<Giải thích ngắn gọn lý do>"
+  "reasoning": "<1-3 câu ngắn, nêu rõ lý do>"
 }}
-"""
+""".strip()
 
-    def _calculate_cost(self, model_name: str, prompt_tokens: int, completion_tokens: int) -> float:
-        model_key = "gpt-4o-mini" if "gpt" in model_name.lower() else "gemini-2.0-flash"
-        config = COST_CONFIG.get(model_key, {"input": 0.15, "output": 0.60})
-        return (prompt_tokens * config["input"] + completion_tokens * config["output"]) / 1_000_000
+    def _clean_json_payload(self, text: str) -> str:
+        payload = (text or "").strip()
+        if payload.startswith("```"):
+            payload = re.sub(r"^```(?:json)?", "", payload).strip()
+            if payload.endswith("```"):
+                payload = payload[:-3].strip()
+        return payload
+
+    def _safe_int_score(self, value: Any, default: int = SCORE_MIN) -> int:
+        try:
+            v = int(value)
+        except Exception:
+            v = default
+        return max(SCORE_MIN, min(SCORE_MAX, v))
+
+    def _calc_cost_usd(self, model_name: str, prompt_tokens: int, completion_tokens: int) -> float:
+        key = "gpt-4o-mini" if "gpt" in model_name.lower() else "gemini-1.5-flash"
+        cfg = COST_CONFIG.get(key, {"input": 0.0, "output": 0.0})
+        return (prompt_tokens * cfg["input"] + completion_tokens * cfg["output"]) / 1_000_000
+
+    def _normalize_provider_result(
+        self,
+        model: str,
+        data: Optional[Dict[str, Any]] = None,
+        error: Optional[str] = None,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        latency_seconds: float = 0.0,
+    ) -> Dict[str, Any]:
+        parsed = data or {}
+        accuracy = self._safe_int_score(parsed.get("accuracy_score", SCORE_MIN))
+        grounding = self._safe_int_score(parsed.get("grounding_score", SCORE_MIN))
+        reasoning = parsed.get("reasoning") or (f"Error: {error}" if error else "")
+
+        usage = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "cost_usd": self._calc_cost_usd(model, prompt_tokens, completion_tokens),
+            "latency_seconds": round(latency_seconds, 4),
+        }
+
+        return {
+            "model": model,
+            "accuracy_score": accuracy,
+            "grounding_score": grounding,
+            "reasoning": reasoning,
+            "error": error,
+            "usage": usage,
+        }
 
     async def _call_gpt_judge(self, prompt: str) -> Dict[str, Any]:
+        start = time.perf_counter()
         try:
-            start_t = time.perf_counter()
-            response = await self.openai_client.chat.completions.create(
-                model=self.gpt_model,
-                messages=[
-                    {"role": "system", "content": "You are a precise AI Quality Evaluator. Always output JSON."},
-                    {"role": "user", "content": prompt}
-                ],
-                response_format={"type": "json_object"},
-                temperature=0
+            response = await asyncio.wait_for(
+                self.openai_client.chat.completions.create(
+                    model=self.gpt_model,
+                    messages=[
+                        {"role": "system", "content": "You are a strict evaluator. Return JSON only."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0,
+                ),
+                timeout=REQUEST_TIMEOUT_SECONDS,
             )
-            data = json.loads(response.choices[0].message.content)
+            payload = self._clean_json_payload(response.choices[0].message.content or "")
+            data = json.loads(payload)
             usage = response.usage
-            return {
-                "scores": data,
-                "usage": {
-                    "prompt_tokens": usage.prompt_tokens,
-                    "completion_tokens": usage.completion_tokens,
-                    "cost": self._calculate_cost(self.gpt_model, usage.prompt_tokens, usage.completion_tokens),
-                    "latency": time.perf_counter() - start_t
-                },
-                "error": None
-            }
+            return self._normalize_provider_result(
+                model=self.gpt_model,
+                data=data,
+                prompt_tokens=getattr(usage, "prompt_tokens", 0),
+                completion_tokens=getattr(usage, "completion_tokens", 0),
+                latency_seconds=time.perf_counter() - start,
+            )
         except Exception as e:
-            err_msg = f"{type(e).__name__}: {str(e)}"
-            return {"scores": {"accuracy_score": 1, "grounding_score": 1, "reasoning": f"Error: {err_msg}"}, "usage": None, "error": err_msg}
+            return self._normalize_provider_result(
+                model=self.gpt_model,
+                error=f"{type(e).__name__}: {e}",
+                latency_seconds=time.perf_counter() - start,
+            )
 
     async def _call_gemini_judge(self, prompt: str) -> Dict[str, Any]:
-        try:
-            start_t = time.perf_counter()
-            response = await self.genai_model.generate_content_async(
-                prompt,
-                generation_config=genai.GenerationConfig(
-                    response_mime_type="application/json",
-                    temperature=0
-                )
-            )
+        start = time.perf_counter()
+        candidates = [self.gemini_model, "models/gemini-2.0-flash", "models/gemini-flash-latest"]
+        last_err = None
+
+        for model_name in candidates:
             try:
-                usage = response.usage_metadata
-                prompt_tokens = usage.prompt_token_count
-                completion_tokens = usage.candidates_token_count
-            except:
-                prompt_tokens, completion_tokens = 0, 0
+                model = self.genai_model if model_name == self.gemini_model else genai.GenerativeModel(model_name)
+                response = await asyncio.wait_for(
+                    model.generate_content_async(
+                        prompt,
+                        generation_config=genai.GenerationConfig(
+                            response_mime_type="application/json",
+                            temperature=0,
+                        ),
+                    ),
+                    timeout=REQUEST_TIMEOUT_SECONDS,
+                )
+                payload = self._clean_json_payload(getattr(response, "text", ""))
+                data = json.loads(payload)
 
-            data = json.loads(response.text)
-            return {
-                "scores": data,
-                "usage": {
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens,
-                    "cost": self._calculate_cost("gemini", prompt_tokens, completion_tokens),
-                    "latency": time.perf_counter() - start_t
-                },
-                "error": None
-            }
-        except Exception as e:
-            err_msg = f"{type(e).__name__}: {str(e)}"
-            return {"scores": {"accuracy_score": 1, "grounding_score": 1, "reasoning": f"Error: {err_msg}"}, "usage": None, "error": err_msg}
+                prompt_tokens = 0
+                completion_tokens = 0
+                usage = getattr(response, "usage_metadata", None)
+                if usage is not None:
+                    prompt_tokens = getattr(usage, "prompt_token_count", 0) or 0
+                    completion_tokens = getattr(usage, "candidates_token_count", 0) or 0
 
-    async def evaluate_multi_judge(self, question: str, agent_answer: str, expected_answer: str, retrieved_chunks: List[str]) -> Dict[str, Any]:
-        prompt = self._build_judge_prompt(question, agent_answer, expected_answer, retrieved_chunks)
-        
-        res_gpt, res_gemini = await asyncio.gather(
-            self._call_gpt_judge(prompt),
-            self._call_gemini_judge(prompt)
+                return self._normalize_provider_result(
+                    model=model_name,
+                    data=data,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    latency_seconds=time.perf_counter() - start,
+                )
+            except Exception as e:
+                last_err = f"{type(e).__name__}: {e}"
+
+        return self._normalize_provider_result(
+            model=self.gemini_model,
+            error=last_err or "Unknown Gemini error",
+            latency_seconds=time.perf_counter() - start,
         )
-        
-        valid_results = []
-        if res_gpt.get("error") is None: valid_results.append(res_gpt["scores"])
-        if res_gemini.get("error") is None: valid_results.append(res_gemini["scores"])
-        
-        degraded = len(valid_results) < 2
-        
-        if not valid_results:
+
+    async def evaluate_multi_judge(
+        self,
+        question: str,
+        agent_answer: str,
+        expected_answer: str,
+        retrieved_chunks: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        prompt = self._build_judge_prompt(
+            question=question,
+            agent_answer=agent_answer,
+            expected_answer=expected_answer,
+            retrieved_chunks=retrieved_chunks or [],
+        )
+
+        gpt_result, gemini_result = await asyncio.gather(
+            self._call_gpt_judge(prompt),
+            self._call_gemini_judge(prompt),
+        )
+
+        valid = [r for r in [gpt_result, gemini_result] if r.get("error") is None]
+        degraded_mode = len(valid) < 2
+
+        if not valid:
             return {
                 "final_score": 1.0,
                 "agreement_rate": 0.0,
                 "accuracy_score_avg": 1.0,
                 "grounding_score_avg": 1.0,
                 "degraded_mode": True,
-                "reasoning": f"Both judges failed. GPT: {res_gpt.get('error')} | Gemini: {res_gemini.get('error')}",
-                "total_cost": 0,
-                "individual_judgments": {"gpt": res_gpt, "gemini": res_gemini}
+                "individual_judgments": {"gpt": gpt_result, "gemini": gemini_result},
+                "usage": {"total_tokens": 0, "total_cost_usd": 0.0},
+                "reasoning": "Both judges failed.",
             }
 
-        acc_scores = [r.get("accuracy_score", 1) for r in valid_results]
-        grd_scores = [r.get("grounding_score", 1) for r in valid_results]
-        
-        avg_acc = sum(acc_scores) / len(acc_scores)
-        avg_grd = sum(grd_scores) / len(grd_scores)
-        
-        final_score = (avg_acc * WEIGHT_ACCURACY) + (avg_grd * WEIGHT_GROUNDING)
-        
-        agreement = 1.0
-        if len(valid_results) == 2:
-            diff_acc = abs(res_gpt["scores"].get("accuracy_score", 1) - res_gemini["scores"].get("accuracy_score", 1))
-            diff_grd = abs(res_gpt["scores"].get("grounding_score", 1) - res_gemini["scores"].get("grounding_score", 1))
+        acc_avg = sum(r["accuracy_score"] for r in valid) / len(valid)
+        grd_avg = sum(r["grounding_score"] for r in valid) / len(valid)
+        final_score = (acc_avg * WEIGHT_ACCURACY) + (grd_avg * WEIGHT_GROUNDING)
+
+        if len(valid) == 2:
+            diff_acc = abs(gpt_result["accuracy_score"] - gemini_result["accuracy_score"])
+            diff_grd = abs(gpt_result["grounding_score"] - gemini_result["grounding_score"])
             if diff_acc <= AGREEMENT_STRICT_DIFF and diff_grd <= AGREEMENT_STRICT_DIFF:
-                agreement = 1.0
+                agreement_rate = 1.0
             elif diff_acc > AGREEMENT_STRICT_DIFF and diff_grd > AGREEMENT_STRICT_DIFF:
-                agreement = 0.0
+                agreement_rate = 0.0
             else:
-                agreement = 0.5
-        
-        total_cost = (res_gpt["usage"]["cost"] if res_gpt["usage"] else 0) + (res_gemini["usage"]["cost"] if res_gemini["usage"] else 0)
-        
+                agreement_rate = 0.5
+        else:
+            agreement_rate = 0.5
+
+        total_tokens = 0
+        total_cost = 0.0
+        for r in [gpt_result, gemini_result]:
+            usage = r.get("usage") or {}
+            total_tokens += int(usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0))
+            total_cost += float(usage.get("cost_usd", 0.0))
+
+        reasoning = valid[0].get("reasoning", "")
+
         return {
             "final_score": round(final_score, 2),
-            "agreement_rate": agreement,
-            "accuracy_score_avg": avg_acc,
-            "grounding_score_avg": avg_grd,
-            "degraded_mode": degraded,
-            "total_cost": total_cost,
+            "agreement_rate": agreement_rate,
+            "accuracy_score_avg": round(acc_avg, 2),
+            "grounding_score_avg": round(grd_avg, 2),
+            "degraded_mode": degraded_mode,
             "individual_judgments": {
-                "gpt": res_gpt,
-                "gemini": res_gemini
-            }
+                "gpt": gpt_result,
+                "gemini": gemini_result,
+            },
+            "usage": {
+                "total_tokens": total_tokens,
+                "total_cost_usd": round(total_cost, 8),
+            },
+            "reasoning": reasoning,
         }
 
-    async def check_position_bias(self, question: str, response_a: str, response_b: str, expected_answer: str, retrieved_chunks: List[str]) -> Dict[str, Any]:
-        def build_compare_prompt(ans_1, ans_2):
-            return f"Compare Response 1: {ans_1} and Response 2: {ans_2} for Question: {question}. Which is better? Return JSON: {{\"better_response\": 1 or 2, \"reasoning\": \"...\"}}"
-        
-        p1 = build_compare_prompt(response_a, response_b)
-        p2 = build_compare_prompt(response_b, response_a)
-        
-        res1, res2 = await asyncio.gather(
-            self._call_gpt_judge(p1),
-            self._call_gpt_judge(p2)
-        )
-        
-        choice1 = res1["scores"].get("better_response")
-        choice2 = res2["scores"].get("better_response")
-        bias_detected = (choice1 == choice2)
-        
+    async def check_position_bias(
+        self,
+        question: str,
+        response_a: str,
+        response_b: str,
+        expected_answer: str,
+        retrieved_chunks: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        context = "\n".join(f"- {c}" for c in (retrieved_chunks or []))
+
+        def _prompt(resp1: str, resp2: str) -> str:
+            return f"""
+Bạn là giám khảo trung lập. Chọn câu trả lời tốt hơn.
+Question: {question}
+Expected Answer: {expected_answer}
+Retrieved Chunks:
+{context}
+Response 1: {resp1}
+Response 2: {resp2}
+Trả về JSON: {{"better_response": 1 hoặc 2, "reasoning": "..."}}
+""".strip()
+
+        async def _call_compare(prompt: str) -> Dict[str, Any]:
+            try:
+                response = await asyncio.wait_for(
+                    self.openai_client.chat.completions.create(
+                        model=self.gpt_model,
+                        messages=[
+                            {"role": "system", "content": "You are a strict evaluator. Return JSON only."},
+                            {"role": "user", "content": prompt},
+                        ],
+                        response_format={"type": "json_object"},
+                        temperature=0,
+                    ),
+                    timeout=REQUEST_TIMEOUT_SECONDS,
+                )
+                payload = self._clean_json_payload(response.choices[0].message.content or "")
+                data = json.loads(payload)
+                better = int(data.get("better_response", 0))
+                if better not in (1, 2):
+                    better = 0
+                return {"better_response": better, "reasoning": data.get("reasoning", "")}
+            except Exception as e:
+                return {"better_response": 0, "reasoning": f"{type(e).__name__}: {e}"}
+
+        p1 = _prompt(response_a, response_b)
+        p2 = _prompt(response_b, response_a)
+        res1, res2 = await asyncio.gather(_call_compare(p1), _call_compare(p2))
+
+        choice1 = res1.get("better_response", 0)
+        choice2 = res2.get("better_response", 0)
+        bias_detected = choice1 == choice2 and choice1 in (1, 2)
+
         return {
             "bias_detected": bias_detected,
             "choices": [choice1, choice2],
-            "reasoning": [res1["scores"].get("reasoning"), res2["scores"].get("reasoning")]
+            "reasoning": [res1.get("reasoning"), res2.get("reasoning")],
         }
