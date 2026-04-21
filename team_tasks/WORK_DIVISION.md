@@ -39,7 +39,7 @@
   - Output: `data/chunks.jsonl`, `data/golden_set.jsonl`
 - **Người 2 - Retrieval Engineer**
   - Input: `chunks.jsonl`, `golden_set.jsonl`
-  - Làm: build FAISS, implement `retrieve_v1/retrieve_v2`, metric retrieval
+  - Làm: build FAISS, tách retrieval sang `agent/retriever.py`, implement `retrieve_v1/retrieve_v2`, metric retrieval
   - Output: agent query schema + retrieval eval pass
 - **Người 3 - LLM Judge Engineer**
   - Input: question, expected_answer, retrieved_chunks, agent_answer
@@ -58,7 +58,7 @@
 1. `python data/synthetic_gen.py --mode chunk`
 2. `python data/synthetic_gen.py --mode golden --n 50`
 3. `python data/validate_dataset.py`
-4. `python agent/main_agent.py --build-index`
+4. `python agent/retriever.py --build-index`
 5. `python main.py --mode benchmark --both`
 6. `python main.py --mode summarize`
 7. `python check_lab.py`

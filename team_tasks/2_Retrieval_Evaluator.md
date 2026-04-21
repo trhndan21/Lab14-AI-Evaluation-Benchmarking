@@ -14,7 +14,8 @@ Xây engine retrieval 2 phiên bản để benchmark:
 - `TEST_RANDOM_TRIALS = 100`
 
 ## File phụ trách
-- `agent/main_agent.py` (hoặc tách `agent/retriever.py`)
+- `agent/retriever.py` (**file mới, tách riêng retrieval**)
+- `agent/main_agent.py` (giữ vai trò wrapper gọi retriever + generation)
 - `engine/retrieval_eval.py`
 - `requirements.txt` (bổ sung `faiss-cpu` nếu thiếu)
 
@@ -50,20 +51,26 @@ Xây engine retrieval 2 phiên bản để benchmark:
 ---
 
 ## Cần sửa gì (cực cụ thể)
-### File 1: `agent/main_agent.py`
-- Refactor class agent để nhận `version` (`v1` hoặc `v2`).
-- Thêm hàm:
+### File 1: `agent/retriever.py` (mới)
+- Tách toàn bộ retrieval logic khỏi `main_agent.py`.
+- Implement các hàm:
   - `build_or_load_index()`
   - `retrieve_v1(question: str, top_k: int) -> dict`
   - `retrieve_v2(question: str, top_k: int) -> dict`
-  - `query(question: str, version: str, top_k: int = 3) -> dict`
-- Output `query` phải có:
-  - `answer`
+  - `retrieve(question: str, version: str, top_k: int = 3) -> dict`
+- Output retrieval chuẩn:
   - `retrieved_chunk_ids`
   - `retrieved_chunks`
+  - `scores`
   - `retrieval_mode` (`v1_random_mix` hoặc `v2_faiss`)
 
-### File 2: `engine/retrieval_eval.py`
+### File 2: `agent/main_agent.py`
+- Giữ phần orchestration:
+  - gọi `Retriever` từ `agent/retriever.py`,
+  - tạo `answer` từ context đã retrieve.
+- Không giữ retrieval logic trực tiếp trong file này.
+
+### File 3: `engine/retrieval_eval.py`
 - Chuẩn hóa evaluator theo expected 1 chunk:
   - `calculate_hit_rate(expected_chunk_id, retrieved_chunk_ids, top_k)`
   - `calculate_mrr(expected_chunk_id, retrieved_chunk_ids)`
@@ -71,7 +78,7 @@ Xây engine retrieval 2 phiên bản để benchmark:
   - `evaluate_batch(...)`
 - Đảm bảo tương thích với schema `golden_set.jsonl` mới.
 
-### File 3: `requirements.txt`
+### File 4: `requirements.txt`
 - Bổ sung dependency nếu thiếu:
   - `faiss-cpu`
   - model embedding đang dùng (nếu cần).
@@ -81,7 +88,7 @@ Xây engine retrieval 2 phiên bản để benchmark:
 ## Flow chạy code từng bước + output mong đợi
 ### Bước 1: Build FAISS index từ chunks
 - Chạy:
-  - `python agent/main_agent.py --build-index`
+  - `python agent/retriever.py --build-index`
 - Script phải:
   1. Đọc `data/chunks.jsonl`.
   2. Embed từng `chunk_text`.
@@ -97,7 +104,7 @@ Xây engine retrieval 2 phiên bản để benchmark:
 
 ### Bước 2: Test retrieval V2 (không random)
 - Chạy:
-  - `python agent/main_agent.py --test-retrieve --version v2 --question "..." --top_k 3`
+  - `python agent/retriever.py --test-retrieve --version v2 --question "..." --top_k 3`
 - Output console mong đợi:
   - in top_k chunk_id + score.
   - mode hiển thị `v2_faiss`.
@@ -106,7 +113,7 @@ Xây engine retrieval 2 phiên bản để benchmark:
 
 ### Bước 3: Test retrieval V1 (50% random)
 - Chạy:
-  - `python agent/main_agent.py --test-retrieve --version v1 --question "..." --top_k 3 --seed 20260421`
+  - `python agent/retriever.py --test-retrieve --version v1 --question "..." --top_k 3 --seed 20260421`
 - Output console mong đợi:
   - log nhánh:
     - `branch=faiss` hoặc
@@ -128,7 +135,12 @@ Xây engine retrieval 2 phiên bản để benchmark:
 ---
 
 ## Schema output bắt buộc bàn giao cho Runner
-- `query(...)` trả về:
+- `retrieve(...)` trả về:
+  - `retrieved_chunk_ids: list[str]`
+  - `retrieved_chunks: list[str]`
+  - `scores: list[float]` (nếu có)
+  - `retrieval_mode: str`
+- `query(...)` (ở `main_agent.py`) trả về:
   - `answer: str`
   - `retrieved_chunk_ids: list[str]`
   - `retrieved_chunks: list[str]`
